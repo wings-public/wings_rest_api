@@ -1,0 +1,9 @@
+{
+    "meta_map" : {"first_name" : "IndividualFName",
+                  "last_name" : "IndividualLName",
+                  "clinical_info" : "Relevant_Clinical_Info",
+                  "date_of_birth" : "IndividualBirthDate",
+                  "gender" : "IndividualSex",
+                  "status" : "IndividualStatus"
+                 } 
+}
