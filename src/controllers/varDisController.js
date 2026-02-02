@@ -4,7 +4,7 @@ const varDiscServices = require('../services/varDiscServices.js');
 const authServices = require('../services/authServices.js');
 const indCont = require('../controllers/indController.js');
 const {tokenOps} = indCont;
-const {centerList,varReqGenSp,varFreqResSp,storeReqDB,getVarDiscReqObj,getHPOParent,getHPOChild,varPhenReqSp,getAdminID,varPhenResultSp,varPhenStatsSp,varContactPISp,varMailSp,varCollabStat,fetchHpoNames,varAssociateReqSp,varAssociateRespSp,fetchHpo} = varDiscServices;
+const {centerList,varReqGenSp,varFreqResSp,storeReqDB,getVarDiscReqObj,getHPOParent,getHPOChild,varPhenReqSp,getAdminID,varPhenResultSp,varPhenStatsSp,varContactPISp,varMailSp,varCollabStat,fetchHpoNames,varAssociateReqSp,varAssociateRespSp,fetchHpo,checkDailyHpoQueryLimit,checkExactQueryLimit} = varDiscServices;
 const {getCenter, checkUser} = authServices;
 
 const lodash = require('lodash');
@@ -455,6 +455,34 @@ const varPhenQuery = async(req,res,next) => {
         var filter_id = req.body.filter_id;
         var hpo_list = req.body.hpo_list;
 
+        // Check daily HPO query limit
+        var canProceedDaily = await checkDailyHpoQueryLimit(db_conn, user_id);
+        if (!canProceedDaily) {
+            var max_daily_queries = parseInt(process.env.MAX_DAILY_HPO_QUERIES) || 15;
+            throw `Daily HPO query limit reached (${max_daily_queries} queries per day). Please try again tomorrow.`;
+        }
+
+        // Generate hash for exact query matching based on mandatory parameters
+        var queryParams = {
+            query_type: query_type,
+            seq_type: seq_type,
+            filter_id: filter_id,
+            ref_build_type: assembly_type,
+            filter_level: filter_level,
+            hpo_list: hpo_list.sort() // Sort to ensure consistent hashing
+        };
+        var query_hash = crypto.createHash('sha256').update(JSON.stringify(queryParams)).digest('hex');
+        console.log(`Query hash: ${query_hash}`);
+
+        // Get max exact queries from environment or default to 10
+        var max_exact_queries = parseInt(process.env.MAX_EXACT_QUERIES) || 10;
+        
+        // Check exact duplicate query limit
+        var canProceedExact = await checkExactQueryLimit(db_conn, user_id, query_hash, max_exact_queries);
+        if (!canProceedExact) {
+            throw `Exact query limit reached (${max_exact_queries} identical queries). Please modify your query parameters.`;
+        }
+
         var json_req = {'var_disc' : query_type};
         json_req['var_disc']['hpoList'] = hpo_list;
 
@@ -501,7 +529,9 @@ const varPhenQuery = async(req,res,next) => {
         console.log("Logging the transformed clause ");
         console.log(hpoInClause);
         const hpo_res = await fetchHpoNames(db_conn,hpo_list);
-        var req_id = await storeReqDB(db_conn,reqObj,hpo_res);
+        
+        // Store with tracking (user_id and query_hash)
+        var req_id = await storeReqDB(db_conn, reqObj, hpo_res, user_id, query_hash);
         console.log("Logging the returned request id "+req_id);
         res.json({"message":{"request_id":req_id}});
         //res.json({"message":"success"});
@@ -677,6 +707,28 @@ const varPhenResults = async(req,res,next) => {
                     console.log(variant);
                 }*/
             } // centers loop
+            
+            // Filter out variants where var+phen < threshold (except 0)
+            // Get minimum variant count threshold from environment or default to 5
+            var min_variant_count = parseInt(process.env.MIN_VARIANT_COUNT_THRESHOLD) || 5;
+            
+            var filteredVarCntObj = {};
+            var filteredVariantCntAnnObj = {};
+            for (var variant in varCntObj) {
+                var varPhenCount = varCntObj[variant]['var+phen'];
+                // Keep variants where var+phen is 0 or >= threshold
+                if (varPhenCount === 0 || varPhenCount >= min_variant_count) {
+                    filteredVarCntObj[variant] = varCntObj[variant];
+                    if (variantCntAnnObj[variant]) {
+                        filteredVariantCntAnnObj[variant] = variantCntAnnObj[variant];
+                    }
+                }
+            }
+            console.log(`Filtered variants: kept ${Object.keys(filteredVarCntObj).length} out of ${Object.keys(varCntObj).length} (threshold: ${min_variant_count})`);
+            // Replace the original objects with filtered ones
+            varCntObj = filteredVarCntObj;
+            variantCntAnnObj = filteredVariantCntAnnObj;
+            
             // update status as no-variants only if all the centers have it.Otherwise it would replace completed status
             if (center_total == novar_center_count) {
                 respObj['status'] = 'no-variants';

@@ -41,31 +41,42 @@ async function varReqGenSp(db_conn,center_id,host_id,variant,assembly_type) {
     }
 }
 
-async function storeReqDB(db_conn,req_json,hpo_list) {
+async function storeReqDB(db_conn, req_json, hpo_list, user_id = null, query_hash = null) {
     try {
-
         console.log("Logging the request json");
         console.log(req_json);
         var req_id = -1;
-        var query_string = `insert into Tbl_Req_Track(Msg,HPO) values(@input1,@input2)`;
-        var result = await db_conn.request()
-                     .input('input1', sql.NVarChar(4000), JSON.stringify(req_json))
-                     .input('input2', sql.NVarChar(1000), JSON.stringify(hpo_list))
-                     .query(query_string);
+        
+        // Build query dynamically based on whether user_id and query_hash are provided
+        var query_string;
+        var request = db_conn.request()
+            .input('input1', sql.NVarChar(4000), JSON.stringify(req_json))
+            .input('input2', sql.NVarChar(1000), JSON.stringify(hpo_list));
+        
+        if (user_id !== null && query_hash !== null) {
+            // Include user_id and query_hash for rate limiting
+            query_string = `insert into Tbl_Req_Track(Msg, HPO, UserID, QueryHash) values(@input1, @input2, @user_id, @query_hash)`;
+            request.input('user_id', sql.Int, user_id)
+                   .input('query_hash', sql.VarChar(64), query_hash);
+        } else {
+            // Legacy behavior - without tracking
+            query_string = `insert into Tbl_Req_Track(Msg, HPO) values(@input1, @input2)`;
+        }
+        
+        var result = await request.query(query_string);
 
         // request to get the identity id
         var result1 = await db_conn.request()
-                     .query('select @@IDENTITY AS [@@IDENTITY]')
+            .query('select @@IDENTITY AS [@@IDENTITY]')
         console.log(result1.recordset);
 
         var rec_set = result1.recordset[0];
         console.log(rec_set);
-        if (  rec_set['@@IDENTITY'] ) {
+        if (rec_set['@@IDENTITY']) {
             console.log("Logging the last inserted id");
             req_id = rec_set['@@IDENTITY'];
             console.log(req_id);
         }
-
 
         return req_id;
     } catch(err) {
@@ -468,4 +479,85 @@ async function varAssociateRespSp(db_conn,req_id,center_id,host_id) {
     }
 }
 
-module.exports = {centerList,varReqGenSp,varFreqResSp,storeReqDB,getVarDiscReqObj,getHPOParent,getHPOChild,varPhenReqSp,getAdminID,varPhenResultSp,varPhenStatsSp,varContactPISp,varMailSp,varCollabStat,fetchHpoNames,varAssociateReqSp,varAssociateRespSp,fetchHpo}
+// Check daily HPO query limit for a user (configurable, default 15 queries per day)
+async function checkDailyHpoQueryLimit(db_conn, user_id) {
+    try {
+        // Get daily limit from environment or default to 15
+        var max_daily_queries = parseInt(process.env.MAX_DAILY_HPO_QUERIES) || 15;
+        
+        var query_string = `
+            SELECT COUNT(*) as query_count 
+            FROM Tbl_Req_Track 
+            WHERE UserID = @user_id 
+            AND CAST(CreatedDate AS DATE) = CAST(GETDATE() AS DATE)
+        `;
+        var result = await db_conn.request()
+            .input('user_id', sql.Int, user_id)
+            .query(query_string);
+        
+        var count = result.recordset[0].query_count;
+        console.log(`Daily HPO queries for user ${user_id}: ${count}/${max_daily_queries}`);
+        
+        if (count >= max_daily_queries) {
+            // Log the rate limit violation
+            await logRateLimitViolation(db_conn, user_id, 'daily_limit', count, null);
+            return false;
+        }
+        
+        return true;
+    } catch(err) {
+        throw new Error(err.message);
+    }
+}
+
+// Check exact duplicate query limit (configurable, default 10)
+async function checkExactQueryLimit(db_conn, user_id, query_hash, max_exact_queries = 10) {
+    try {
+        var query_string = `
+            SELECT COUNT(*) as query_count 
+            FROM Tbl_Req_Track 
+            WHERE UserID = @user_id 
+            AND QueryHash = @query_hash
+        `;
+        var result = await db_conn.request()
+            .input('user_id', sql.Int, user_id)
+            .input('query_hash', sql.VarChar(64), query_hash)
+            .query(query_string);
+        
+        var count = result.recordset[0].query_count;
+        console.log(`Exact query count for user ${user_id} (hash: ${query_hash.substring(0,8)}...): ${count}/${max_exact_queries}`);
+        
+        if (count >= max_exact_queries) {
+            // Log the rate limit violation
+            await logRateLimitViolation(db_conn, user_id, 'exact_query_limit', count, query_hash);
+            return false;
+        }
+        
+        return true;
+    } catch(err) {
+        throw new Error(err.message);
+    }
+}
+
+// Log rate limit violations for tracking and auditing
+async function logRateLimitViolation(db_conn, user_id, violation_type, query_count, query_hash) {
+    try {
+        var query_string = `
+            INSERT INTO Tbl_RateLimit_Violations (UserID, ViolationType, QueryCount, QueryHash, ViolationDate)
+            VALUES (@user_id, @violation_type, @query_count, @query_hash, GETDATE())
+        `;
+        await db_conn.request()
+            .input('user_id', sql.Int, user_id)
+            .input('violation_type', sql.VarChar(50), violation_type)
+            .input('query_count', sql.Int, query_count)
+            .input('query_hash', sql.VarChar(64), query_hash)
+            .query(query_string);
+        
+        console.log(`Rate limit violation logged: User ${user_id}, Type: ${violation_type}, Count: ${query_count}`);
+    } catch(err) {
+        // Don't throw error if logging fails - just log it
+        console.error(`Failed to log rate limit violation: ${err.message}`);
+    }
+}
+
+module.exports = {centerList,varReqGenSp,varFreqResSp,storeReqDB,getVarDiscReqObj,getHPOParent,getHPOChild,varPhenReqSp,getAdminID,varPhenResultSp,varPhenStatsSp,varContactPISp,varMailSp,varCollabStat,fetchHpoNames,varAssociateReqSp,varAssociateRespSp,fetchHpo,checkDailyHpoQueryLimit,checkExactQueryLimit}
